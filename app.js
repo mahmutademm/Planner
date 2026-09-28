@@ -5,7 +5,9 @@ const cfg = window.PLANNER_CONFIG || {};
 const $app = document.getElementById("app");
 const $tabs = document.getElementById("tabs");
 
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+const swReg = "serviceWorker" in navigator
+  ? navigator.serviceWorker.register("sw.js", { scope: "./" }).catch((e) => { window.__swErr = e.message; return null; })
+  : Promise.resolve(null);
 
 if (!cfg.url || !cfg.anonKey) {
   $app.innerHTML = `<div class="boot">App not configured yet.</div>`;
@@ -46,25 +48,30 @@ const S = {
   session: null, tab: "week", day: nyToday(),
   days: {}, tasks: [], deadlines: [], open: [], emails: [], notes: [], prefs: null,
   inboxFilter: ls.get("inboxFilter", "action"), loaded: false,
+  calDays: {}, calMains: {}, calMonth: null, calSel: null, calFilter: ls.get("calFilter", "all"),
 };
 
 // ───────── data ─────────
 async function loadAll() {
   const today = nyToday(), end = addDays(today, 6);
-  const [days, tasks, deadlines, open, emails, notes, prefs] = await Promise.all([
+  const [days, tasks, deadlines, open, emails, notes, prefs, calDays, calMains] = await Promise.all([
     sb.from("days").select("*").gte("date", today).lte("date", end),
     sb.from("tasks").select("*").gte("date", today).lte("date", end).order("date").order("start_time", { nullsFirst: false }),
-    sb.from("deadlines").select("*").gte("due_date", addDays(today, -1)).lte("due_date", addDays(today, 30)).order("due_date"),
+    sb.from("deadlines").select("*").gte("due_date", addDays(today, -60)).order("due_date").limit(800),
     sb.from("open_items").select("*").order("position").order("since"),
     sb.from("emails").select("*").order("received_at", { ascending: false }).limit(150),
     sb.from("notes").select("*").order("created_at", { ascending: false }).limit(60),
     sb.from("prefs").select("*").eq("id", 1).maybeSingle(),
+    sb.from("days").select("date,headline,mode").gte("date", addDays(today, -60)).lte("date", addDays(today, 365)),
+    sb.from("tasks").select("date,title,start_time").eq("kind", "main").gte("date", addDays(today, -60)).lte("date", addDays(today, 365)),
   ]);
-  const err = [days, tasks, deadlines, open, emails, notes, prefs].find((r) => r.error);
+  const err = [days, tasks, deadlines, open, emails, notes, prefs, calDays, calMains].find((r) => r.error);
   if (err) { toast("Couldn't load: " + err.error.message); return; }
   S.days = Object.fromEntries(days.data.map((d) => [d.date, d]));
   S.tasks = tasks.data; S.deadlines = deadlines.data; S.open = open.data;
   S.emails = emails.data; S.notes = notes.data; S.prefs = prefs.data;
+  S.calDays = Object.fromEntries(calDays.data.map((d) => [d.date, d]));
+  S.calMains = {}; for (const m of calMains.data) (S.calMains[m.date] ||= []).push(m);
   S.loaded = true;
   if (S.day < today || S.day > end) S.day = today;
   render();
@@ -92,7 +99,7 @@ async function patch(table, id, values, key = "id") {
 // ───────── routing ─────────
 function route() {
   const h = (location.hash || "#week").slice(1);
-  S.tab = ["week", "inbox", "notes", "lists", "settings", "deadlines"].includes(h) ? h : "week";
+  S.tab = ["week", "calendar", "inbox", "notes", "lists", "settings", "deadlines"].includes(h) ? h : "week";
   if (S.tab === "deadlines") S.tab = "lists";
   render();
 }
@@ -104,7 +111,7 @@ function render() {
   for (const a of $tabs.querySelectorAll("a")) a.classList.toggle("on", a.dataset.tab === S.tab);
   updateBadges();
   if (!S.loaded) { $app.innerHTML = `<div class="boot">Loading…</div>`; return; }
-  ({ week: renderWeek, inbox: renderInbox, notes: renderNotes, lists: renderLists, settings: renderSettings })[S.tab]();
+  ({ week: renderWeek, calendar: renderCalendar, inbox: renderInbox, notes: renderNotes, lists: renderLists, settings: renderSettings })[S.tab]();
 }
 
 function updateBadges() {
@@ -268,6 +275,63 @@ function addTaskDialog(date) {
   });
 }
 
+
+// ───────── CALENDAR (deadlines & exams only) ─────────
+const CAT = [
+  ["exam", "Exams", (d) => /exam|midterm|final/i.test((d.type || "") + " " + d.item) && !/Transfer|Big 4/.test(d.type || "")],
+  ["transfer", "Transfer", (d) => d.type === "Transfer"],
+  ["big4", "Big 4", (d) => d.type === "Big 4"],
+  ["honors", "Honors", (d) => d.type === "Honors"],
+  ["hw", "Homework & quizzes", () => true],
+];
+const catOf = (d) => CAT.find(([, , f]) => f(d))[0];
+function renderCalendar() {
+  const today = nyToday();
+  if (!S.calMonth) S.calMonth = today.slice(0, 7);
+  const [y, m] = S.calMonth.split("-").map(Number);
+  const first = `${S.calMonth}-01`;
+  const startDow = new Date(first + "T12:00:00Z").getUTCDay();
+  const nDays = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const f = S.calFilter;
+  const shown = S.deadlines.filter((d) => f === "all" || catOf(d) === f);
+  const byDay = {};
+  for (const d of shown) (byDay[d.due_date] ||= []).push(d);
+  const monthName = new Date(first + "T12:00:00Z").toLocaleDateString("en-US", { month: "long", year: "numeric", timeZone: "UTC" });
+  const cells = [];
+  for (let i = 0; i < startDow; i++) cells.push(`<div class="cal-cell empty"></div>`);
+  for (let dd = 1; dd <= nDays; dd++) {
+    const iso = `${S.calMonth}-${String(dd).padStart(2, "0")}`;
+    const items = byDay[iso] || [];
+    const dots = [...new Set(items.map(catOf))].map((c) => `<i class="dot c-${c}"></i>`).join("");
+    cells.push(`<button class="cal-cell ${iso === today ? "today" : ""} ${iso === S.calSel ? "on" : ""} ${items.length ? "has" : ""} ${iso < today ? "past" : ""}" data-cal="${iso}">
+      <span class="n">${dd}</span><span class="dots">${dots}</span></button>`);
+  }
+  const sel = S.calSel && S.calSel.startsWith(S.calMonth) ? S.calSel : null;
+  const list = sel ? (byDay[sel] || []) : shown.filter((d) => d.due_date.startsWith(S.calMonth));
+  const dayInfo = sel ? (S.calDays[sel] || {}) : null;
+  const mains = sel ? (S.calMains[sel] || []) : [];
+  $app.innerHTML = `
+    <h1>Calendar</h1><p class="sub">Deadlines & exams only.</p>
+    <div class="chips">${[["all", "All"], ...CAT.map(([k, l]) => [k, l])].map(([k, l]) => `<button class="chip ${f === k ? "on" : ""}" data-cf="${k}">${k !== "all" ? `<i class="dot c-${k}"></i> ` : ""}${l}</button>`).join("")}</div>
+    <div class="row" style="margin:14px 0 8px">
+      <button class="btn" data-mv="-1" aria-label="Previous month">‹</button>
+      <div class="grow" style="text-align:center;font-weight:650">${monthName}</div>
+      <button class="btn" data-mv="1" aria-label="Next month">›</button></div>
+    <div class="cal-grid">${["S", "M", "T", "W", "T", "F", "S"].map((x) => `<div class="cal-h">${x}</div>`).join("")}${cells.join("")}</div>
+    <h2>${sel ? longDate(sel) : "This month"}${sel ? ` <button class="btn link small" id="cal-clear">show month</button>` : ""}</h2>
+    ${sel && (dayInfo.headline || mains.length) ? `<div class="card agent" style="margin-bottom:8px"><div class="who">Plan that day</div>
+      ${dayInfo.headline ? `<div style="font-weight:600">${esc(dayInfo.headline)}</div>` : ""}
+      ${mains.map((mm) => `<div class="small">Main: ${hm(mm.start_time)} ${esc(mm.title)}</div>`).join("")}</div>` : ""}
+    <div class="stack">${list.length ? list.map(deadlineRow).join("") : `<div class="empty">Nothing due${sel ? " this day" : " this month"}.</div>`}</div>`;
+  $app.querySelectorAll("[data-cf]").forEach((b) => (b.onclick = () => { S.calFilter = b.dataset.cf; ls.set("calFilter", S.calFilter); renderCalendar(); }));
+  $app.querySelectorAll("[data-mv]").forEach((b) => (b.onclick = () => {
+    const d = new Date(Date.UTC(y, m - 1 + Number(b.dataset.mv), 1)); S.calMonth = d.toISOString().slice(0, 7); S.calSel = null; renderCalendar();
+  }));
+  $app.querySelectorAll("[data-cal]").forEach((b) => (b.onclick = () => { S.calSel = S.calSel === b.dataset.cal ? null : b.dataset.cal; renderCalendar(); }));
+  $app.querySelectorAll("[data-dl]").forEach((b) => (b.onclick = () => toggleDeadline(b.dataset.dl)));
+  document.getElementById("cal-clear")?.addEventListener("click", () => { S.calSel = null; renderCalendar(); });
+}
+
 // ───────── INBOX ─────────
 function renderInbox() {
   const cats = [["action", "Needs you"], ["waiting", "Waiting"], ["fyi", "FYI"], ["all", "All"]];
@@ -334,7 +398,7 @@ function renderLists() {
   const today = nyToday();
   const open = S.open.filter((o) => o.status !== "done");
   const doneRecent = S.open.filter((o) => o.status === "done").slice(-5);
-  const upcoming = S.deadlines.filter((d) => d.due_date >= today);
+  const upcoming = S.deadlines.filter((d) => d.due_date >= today && d.due_date <= addDays(today, 30));
   $app.innerHTML = `
     <h1>Lists</h1>
     <h2>Open items</h2>
@@ -397,9 +461,11 @@ function renderSettings() {
     ${isIOS() && !isStandalone() ? installHint() : ""}
     <h2>Notifications on this device</h2>
     <div class="card stack">
-      <div class="small muted">Status: <b>${perm === "granted" ? "On" : perm === "denied" ? "Blocked in iPhone Settings" : perm === "unsupported" ? "Open from home screen to enable" : "Off"}</b></div>
+      <div class="small muted">Status: <b>${perm === "granted" ? "Allowed" : perm === "denied" ? "Blocked in iPhone Settings" : perm === "unsupported" ? "Open from home screen to enable" : "Off"}</b></div>
       <button class="btn primary block" id="push-on">${perm === "granted" ? "Re-register this device" : "Enable notifications"}</button>
       <button class="btn block" id="push-test">Send a test notification</button>
+      <div id="push-log" class="small" style="white-space:pre-wrap"></div>
+      <div id="diag" class="small muted" style="font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap">Checking…</div>
     </div>
     <h2>What to notify</h2>
     <div class="card list-card">
@@ -424,9 +490,12 @@ function renderSettings() {
   document.getElementById("lead").onchange = (e) => patch("prefs", 1, { task_lead_min: Number(e.target.value) || 0 }).then(loadAll);
   document.getElementById("push-on").onclick = enablePush;
   document.getElementById("push-test").onclick = async () => {
+    const { count } = await sb.from("push_subscriptions").select("*", { count: "exact", head: true });
+    if (!count) return pushLog("✕ No device is registered yet — tap Enable notifications first.");
     const { error } = await sb.from("notifications").insert({ title: "Test notification ✅", body: "Push notifications are working.", kind: "test" });
-    toast(error ? error.message : "Queued — it should arrive within a minute.");
+    pushLog(error ? "✕ " + error.message : "✓ Queued — it should arrive within a minute (lock your phone to see it).");
   };
+  runDiagnostics();
   document.getElementById("out").onclick = () => sb.auth.signOut();
 }
 
@@ -435,25 +504,66 @@ function b64ToUint8(b64) {
   const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
   return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
 }
+function pushLog(line, reset = false) {
+  const el = document.getElementById("push-log");
+  if (!el) return toast(line);
+  el.textContent = (reset ? "" : el.textContent + (el.textContent ? "\n" : "")) + line;
+}
+const withTimeout = (p, ms, label) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(label + " timed out")), ms))]);
+
+async function runDiagnostics() {
+  const el = document.getElementById("diag");
+  if (!el) return;
+  const lines = [];
+  const iosVer = (navigator.userAgent.match(/OS (\d+)_(\d+)/) || []).slice(1).join(".");
+  lines.push(`Home Screen app: ${isStandalone() ? "yes" : "NO — open from Home Screen"}`);
+  if (isIOS()) lines.push(`iOS: ${iosVer || "?"}${iosVer && parseFloat(iosVer) < 16.4 ? " (needs 16.4+)" : ""}`);
+  lines.push(`Push supported: ${"PushManager" in window && "Notification" in window ? "yes" : "no"}`);
+  lines.push(`Permission: ${"Notification" in window ? Notification.permission : "n/a"}`);
+  let reg = null;
+  try { reg = await withTimeout(swReg, 4000, "worker"); } catch {}
+  const st = reg ? (reg.active ? "active" : reg.installing ? "installing" : reg.waiting ? "waiting" : "registered") : (window.__swErr ? "failed: " + window.__swErr : "not registered");
+  lines.push(`Background worker: ${st}`);
+  let sub = null;
+  try { sub = reg && reg.pushManager ? await reg.pushManager.getSubscription() : null; } catch {}
+  lines.push(`This device subscribed: ${sub ? "yes" : "no"}`);
+  const { count } = await sb.from("push_subscriptions").select("*", { count: "exact", head: true });
+  lines.push(`Devices saved on server: ${count ?? "?"}`);
+  el.textContent = lines.join("\n");
+}
+
 async function enablePush() {
-  if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-    return toast(isIOS() ? "Add Planner to your Home Screen first, then open it from there." : "This browser doesn't support push.");
-  }
-  const perm = await Notification.requestPermission();
-  if (perm !== "granted") return toast("Notifications not allowed. You can change this in iPhone Settings → Planner.");
+  pushLog("", true);
   try {
-    const reg = await navigator.serviceWorker.ready;
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      return pushLog(isIOS() && !isStandalone()
+        ? "✕ Open Planner from your Home Screen icon (not Safari), then try again."
+        : "✕ This browser doesn't support push (iPhone needs iOS 16.4+ and the Home Screen app).");
+    }
+    pushLog("1/4 Asking permission…");
+    const perm = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+    if (perm !== "granted") return pushLog("✕ Permission is " + perm + ". Turn it on in iPhone Settings → Notifications → Planner.");
+    pushLog("2/4 Starting background worker…");
+    let reg = await withTimeout(swReg, 8000, "Background worker");
+    if (!reg) reg = await navigator.serviceWorker.register("sw.js", { scope: "./" });
+    reg = await withTimeout(navigator.serviceWorker.ready, 10000, "Background worker");
+    pushLog("3/4 Subscribing this device…");
     const { data, error } = await sb.rpc("public_config");
-    if (error || !data?.vapid_public) throw new Error(error?.message || "Missing push key");
+    if (error || !data?.vapid_public) throw new Error(error?.message || "server push key missing");
     let sub = await reg.pushManager.getSubscription();
-    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(data.vapid_public) });
+    if (!sub) sub = await withTimeout(reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(data.vapid_public) }), 15000, "Subscribe");
     const j = sub.toJSON();
+    pushLog("4/4 Saving to server…");
     const { error: e2 } = await sb.from("push_subscriptions").upsert({
       endpoint: j.endpoint, p256dh: j.keys.p256dh, auth: j.keys.auth, user_agent: navigator.userAgent,
     });
     if (e2) throw e2;
-    toast("Notifications on ✅"); renderSettings();
-  } catch (e) { toast("Couldn't enable: " + e.message); }
+    pushLog("✓ Notifications on. Tap “Send a test notification”.");
+  } catch (e) {
+    pushLog("✕ " + (e.message || e) + " — screenshot this and send it to Claude.");
+  } finally {
+    runDiagnostics();
+  }
 }
 
 // ───────── boot ─────────
