@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Planner</title>
+  <meta name="theme-color" content="#f6f5f1" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#16171a" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Planner">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="styles.css">
+  <script src="config.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div id="app">
+    <div class="boot">Loading…</div>
+  </div>
+  <nav id="tabs" hidden>
+    <a href="#week"      data-tab="week"><span class="ti">▦</span>Week</a>
+    <a href="#inbox"     data-tab="inbox"><span class="ti">✉</span>Inbox<b class="badge" id="b-inbox" hidden></b></a>
+    <a href="#notes"     data-tab="notes"><span class="ti">✎</span>Notes<b class="badge" id="b-notes" hidden></b></a>
+    <a href="#lists"     data-tab="lists"><span class="ti">☰</span>Lists</a>
+    <a href="#settings"  data-tab="settings"><span class="ti">⚙</span>Settings</a>
+  </nav>
+  <div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>
